@@ -13,16 +13,17 @@ from torch.utils.data import Dataset, ConcatDataset, Subset
 from torch._utils import _accumulate
 import torchvision.transforms as transforms
 
-
 class Batch_Balanced_Dataset(object):
-
     def __init__(self, opt):
         """
         Modulate the data ratio in the batch.
         For example, when select_data is "MJ-ST" and batch_ratio is "0.5-0.5",
         the 50% of the batch is filled with MJ and the other 50% of the batch is filled with ST.
         """
-        log = open(f'./saved_models/{opt.exp_name}/log_dataset.txt', 'a')
+        # Формируем директорию для логов: используем saved_models_dir и exp_name
+        exp_dir = os.path.join(opt.saved_models_dir, opt.exp_name)
+        os.makedirs(exp_dir, exist_ok=True)
+        log = open(os.path.join(exp_dir, 'log_dataset.txt'), 'a', encoding='utf-8')
         dashed_line = '-' * 80
         print(dashed_line)
         log.write(dashed_line + '\n')
@@ -96,7 +97,6 @@ class Batch_Balanced_Dataset(object):
                 pass
 
         balanced_batch_images = torch.cat(balanced_batch_images, 0)
-
         return balanced_batch_images, balanced_batch_texts
 
 
