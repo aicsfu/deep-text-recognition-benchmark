@@ -10,6 +10,10 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 import nest_asyncio
 import asyncio
+import pandas as pd
+import base64
+import mimetypes
+import json
 
 # Применяем nest_asyncio, чтобы избежать ошибки "Cannot close a running event loop"
 nest_asyncio.apply()
@@ -52,6 +56,19 @@ CROPS_DIR = os.path.join(os.getcwd(), "crops")
 if os.path.exists(CROPS_DIR):
     shutil.rmtree(CROPS_DIR)
 os.makedirs(CROPS_DIR, exist_ok=True)
+
+
+# ==== Функция для конвертации изображения в base64 HTML (для вставки в таблицу) ====
+def image_to_base64_html(image_path, max_width=200):
+    if not os.path.exists(image_path):
+        return ""
+    with open(image_path, "rb") as img_file:
+        img_data = img_file.read()
+    mime_type, _ = mimetypes.guess_type(image_path)
+    if mime_type is None:
+        mime_type = "image/png"
+    b64_data = base64.b64encode(img_data).decode("utf-8")
+    return f'<img src="data:{mime_type};base64,{b64_data}" style="max-width: {max_width}px;"/>'
 
 
 # ==== Загрузка модели ====
@@ -122,16 +139,11 @@ def process_full_image(image_path, opt, crops_dir):
         f"[DEBUG] Найдено {len(detections)} текстовых блоков. Время детекции: {detection_time:.2f} сек."
     )
 
-    predictions = []
+    crop_results = []  # Для HTML-отчёта (thumbnail + prediction)
+    annotations_list = []  # Для COCO-подобной разметки
     total_recognition_time = 0
-    recognized_count = 0
 
     for i, (bbox, _, confidence) in enumerate(detections):
-        # Здесь можно настроить порог уверенности (оставляем все блоки, confidence >= 0.0)
-        if confidence < 0.0:
-            print(f"[DEBUG] Блок {i:03} пропущен (confidence {confidence:.2f})")
-            continue
-
         pts = np.array(bbox).astype(int)
         x, y, w, h = cv2.boundingRect(pts)
         cropped_img = image[y : y + h, x : x + w]
@@ -147,19 +159,69 @@ def process_full_image(image_path, opt, crops_dir):
         prediction = predict(model, converter, image_tensor_crop, opt)
         recognition_time = time.time() - start_recognition
         total_recognition_time += recognition_time
-        recognized_count += 1
 
-        predictions.append(prediction)
+        # Добавляем данные для HTML-отчёта
+        crop_results.append(
+            {
+                "thumbnail": image_to_base64_html(crop_path, max_width=150),
+                "prediction": prediction,
+            }
+        )
+        # Добавляем данные для COCO-подобной разметки (bbox в формате [x, y, w, h])
+        annotation = {
+            "id": i,
+            "bbox": [int(x), int(y), int(w), int(h)],
+            "text": prediction,
+        }
+        annotations_list.append(annotation)
+
         print(f"[{i:03}] → {prediction} ({recognition_time*1000:.2f} мс)")
 
-    final_text = " ".join(predictions)
+    final_text = " ".join([item["prediction"] for item in crop_results])
     print("\n📜 Распознанный текст:")
     print(final_text)
     print(f"\n⏱ Время детекции: {detection_time:.2f} сек")
     print(
         f"⏱ Суммарное время распознавания блоков: {total_recognition_time*1000:.2f} мс"
     )
-    return final_text, predictions, detection_time, total_recognition_time
+
+    # Генерация HTML-таблицы с обрезками и предсказаниями
+    df_html = pd.DataFrame(crop_results, columns=["thumbnail", "prediction"])
+    table_html = df_html.to_html(escape=False, index=False)
+
+    # Оборачиваем таблицу в полноценный HTML-документ с указанием кодировки UTF-8
+    full_html = f"""<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Отчёт OCR</title>
+  </head>
+  <body>
+    {table_html}
+  </body>
+</html>
+"""
+
+    html_path = os.path.join(os.getcwd(), "results.html")
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(full_html)
+    print(f"[DEBUG] HTML-отчёт сохранён: {html_path}")
+
+    # Генерация COCO-подобной разметки в виде JSON-словаря
+    coco_annotations = {"annotations": annotations_list}
+    json_path = os.path.join(os.getcwd(), "results.json")
+    with open(json_path, "w", encoding="utf-8") as json_file:
+        json.dump(coco_annotations, json_file, ensure_ascii=False, indent=4)
+    print(f"[DEBUG] COCO JSON разметка сохранена: {json_path}")
+
+    return (
+        final_text,
+        crop_results,
+        detection_time,
+        total_recognition_time,
+        html_path,
+        json_path,
+    )
 
 
 # ==== Обработчик входящих фото и документов (файлов) в Telegram боте ====
@@ -173,9 +235,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print("[DEBUG] Фото скачано")
 
     start = time.time()
-    final_text, _, detection_time, total_recognition_time = process_full_image(
-        local_path, opt, CROPS_DIR
-    )
+    (
+        final_text,
+        crop_results,
+        detection_time,
+        total_recognition_time,
+        html_path,
+        json_path,
+    ) = process_full_image(local_path, opt, CROPS_DIR)
     total_duration = time.time() - start
 
     reply = (
@@ -186,6 +253,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     print(f"[DEBUG] Ответ: {reply}")
     await update.message.reply_text(reply)
+
+    # Отправляем HTML-отчёт как документ
+    with open(html_path, "rb") as html_file:
+        await update.message.reply_document(document=html_file, filename="results.html")
+    print("[DEBUG] HTML-отчёт отправлен пользователю.")
+
+    # Отправляем JSON с COCO-разметкой как документ
+    with open(json_path, "rb") as json_file:
+        await update.message.reply_document(document=json_file, filename="results.json")
+    print("[DEBUG] JSON разметка отправлена пользователю.")
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -204,9 +281,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print("[DEBUG] Документ скачан")
 
     start = time.time()
-    final_text, _, detection_time, total_recognition_time = process_full_image(
-        local_path, opt, CROPS_DIR
-    )
+    (
+        final_text,
+        crop_results,
+        detection_time,
+        total_recognition_time,
+        html_path,
+        json_path,
+    ) = process_full_image(local_path, opt, CROPS_DIR)
     total_duration = time.time() - start
 
     reply = (
@@ -217,6 +299,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     print(f"[DEBUG] Ответ: {reply}")
     await update.message.reply_text(reply)
+
+    # Отправляем HTML-отчёт как документ
+    with open(html_path, "rb") as html_file:
+        await update.message.reply_document(document=html_file, filename="results.html")
+    print("[DEBUG] HTML-отчёт отправлен пользователю.")
+
+    # Отправляем JSON с COCO-разметкой как документ
+    with open(json_path, "rb") as json_file:
+        await update.message.reply_document(document=json_file, filename="results.json")
+    print("[DEBUG] JSON разметка отправлена пользователю.")
 
 
 # ==== Запуск бота ====
